@@ -5,6 +5,7 @@ import (
 	"fmt"
 	errpkg "github.com/pkg/errors"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -427,4 +428,9 @@ func ConvertNodeToNodeInfo(node *corev1.Node) model.NodeInfo {
 		CustomTaints:      node.Spec.Taints,
 		State:             model.NodeStateActivated,
 	}
+}
+
+// ParseInt64 parses a string to an int64 value
+func ParseInt64(s string) (int64, error) {
+	return strconv.ParseInt(s, 10, 64)
 }

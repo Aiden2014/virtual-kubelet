@@ -28,13 +28,15 @@ import (
 type VPodStore struct {
 	sync.RWMutex // This mutex is used for thread-safe access to the store.
 
-	podKeyToPod map[string]*corev1.Pod // Maps pod keys to their corresponding pods from provider
+	podKeyToPod      map[string]*corev1.Pod // Maps pod keys to their corresponding pods from provider
+	bizKeyToRevision map[string]int64       // Maps bizKey to its latest revision number
 }
 
 func NewVPodStore() *VPodStore {
 	return &VPodStore{
-		RWMutex:     sync.RWMutex{},
-		podKeyToPod: make(map[string]*corev1.Pod),
+		RWMutex:          sync.RWMutex{},
+		podKeyToPod:      make(map[string]*corev1.Pod),
+		bizKeyToRevision: make(map[string]int64),
 	}
 }
 
@@ -76,6 +78,33 @@ func (r *VPodStore) GetPods() []*corev1.Pod {
 	return ret
 }
 
+// UpdateBizRevision updates the revision for a specific bizKey
+func (r *VPodStore) UpdateBizRevision(bizKey string, revision int64) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.bizKeyToRevision[bizKey] = revision
+}
+
+// GetBizRevision gets the current revision for a specific bizKey
+func (r *VPodStore) GetBizRevision(bizKey string) int64 {
+	r.RLock()
+	defer r.RUnlock()
+
+	return r.bizKeyToRevision[bizKey]
+}
+
+// ShouldDeleteBiz checks if a biz should be deleted based on its revision
+// Returns true if delete should proceed, false otherwise
+func (r *VPodStore) ShouldDeleteBiz(bizKey string, revision int64) bool {
+	r.RLock()
+	defer r.RUnlock()
+
+	currentRevision, exists := r.bizKeyToRevision[bizKey]
+	// If it doesn't exist in our tracking or the deletion revision is greater/equal, allow deletion
+	return !exists || revision >= currentRevision
+}
+
 func (r *VPodStore) CheckContainerStatusNeedSync(pod *corev1.Pod, bizStatusData model.BizStatusData) bool {
 	r.Lock()
 	defer r.Unlock()
@@ -93,20 +122,29 @@ func (r *VPodStore) CheckContainerStatusNeedSync(pod *corev1.Pod, bizStatusData 
 		}
 	}
 
+	// If no matching container is found, return false
+	if matchedContainer == nil {
+		return false
+	}
+
 	// the earliest change time of the container status when no time
 	oldChangeTime := time.Time{}
-	if matchedContainer != nil {
-		if matchedStatus != nil {
-			if matchedStatus.State.Running != nil {
-				oldChangeTime = matchedStatus.State.Running.StartedAt.Time
-			}
-			if matchedStatus.State.Terminated != nil {
-				oldChangeTime = matchedStatus.State.Terminated.FinishedAt.Time
-			}
-			if matchedStatus.State.Waiting != nil && pod.Status.Conditions != nil && len(pod.Status.Conditions) > 0 {
-				oldChangeTime = pod.Status.Conditions[0].LastTransitionTime.Time
-			}
+	if matchedStatus != nil {
+		if matchedStatus.State.Running != nil {
+			oldChangeTime = matchedStatus.State.Running.StartedAt.Time
 		}
+		if matchedStatus.State.Terminated != nil {
+			oldChangeTime = matchedStatus.State.Terminated.FinishedAt.Time
+		}
+		if matchedStatus.State.Waiting != nil && pod.Status.Conditions != nil && len(pod.Status.Conditions) > 0 {
+			oldChangeTime = pod.Status.Conditions[0].LastTransitionTime.Time
+		}
+	}
+
+	// Update the revision tracking for this biz container
+	bizKey := utils.GetBizUniqueKey(matchedContainer)
+	if bizKey != "" && bizStatusData.Revision > 0 {
+		r.bizKeyToRevision[bizKey] = bizStatusData.Revision
 	}
 
 	// 优化 bizStatusData.ChangeTime，只有 bizState 变化的时间才需要更新

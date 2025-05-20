@@ -48,6 +48,11 @@ const (
 )
 
 const (
+	// AnnotationKeyOfPodRevision is a constant string used as a key for pod revision in pod annotations.
+	AnnotationKeyOfPodRevision = "revision.koupleless.io/pod"
+)
+
+const (
 	// TaintKeyOfVnode is a constant string used as a key for taints related to virtual nodes in Kubernetes objects.
 	TaintKeyOfVnode = "schedule.koupleless.io/virtual-node"
 	// TaintKeyOfEnv is a constant string used as a key for taints related to node environments in Kubernetes objects.

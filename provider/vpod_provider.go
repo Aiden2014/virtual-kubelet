@@ -16,15 +16,16 @@ package provider
 
 import (
 	"context"
+	"sort"
+	"strings"
+	"time"
+
 	"github.com/koupleless/virtual-kubelet/tunnel"
 	"github.com/koupleless/virtual-kubelet/virtual_kubelet/node"
 	"github.com/koupleless/virtual-kubelet/virtual_kubelet/node/nodeutil"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/koupleless/virtual-kubelet/common/tracker"
@@ -86,6 +87,13 @@ func (b *VPodProvider) syncBizStatusToKube(ctx context.Context, bizStatusData mo
 		logger.Errorf("skip updating non-exist pod status for biz %s pod %s", bizStatusData.Key, bizStatusData.PodKey)
 		return
 	}
+
+	// If the biz revision is set in the status data, update our tracking
+	if bizStatusData.Revision > 0 {
+		b.vPodStore.UpdateBizRevision(bizStatusData.Key, bizStatusData.Revision)
+		logger.Infof("Updated revision for module %s to %d", bizStatusData.Key, bizStatusData.Revision)
+	}
+
 	podStatus, _ := b.GetPodStatus(ctx, pod, bizStatusData)
 
 	podCopy := pod.DeepCopy()
@@ -99,6 +107,13 @@ func (b *VPodProvider) SyncAllBizStatusToKube(ctx context.Context, bizStatusData
 	bizKeyToBizStatusData := make(map[string]model.BizStatusData)
 	for _, bizStatusData := range bizStatusDatas {
 		bizKeyToBizStatusData[bizStatusData.Key] = bizStatusData
+
+		// Update the revision tracking if the bizStatusData has a revision
+		if bizStatusData.Revision > 0 {
+			b.vPodStore.UpdateBizRevision(bizStatusData.Key, bizStatusData.Revision)
+			log.G(ctx).Infof("Updated revision for module %s to %d from SyncAllBizStatusToKube",
+				bizStatusData.Key, bizStatusData.Revision)
+		}
 	}
 
 	pods := b.vPodStore.GetPods()
@@ -129,6 +144,7 @@ func (b *VPodProvider) SyncAllBizStatusToKube(ctx context.Context, bizStatusData
 					PodKey:     podKey,
 					State:      string(model.BizStateUnResolved),
 					ChangeTime: now,
+					Revision:   b.vPodStore.GetBizRevision(bizKey), // Use current revision if available
 				}
 			}
 
@@ -159,6 +175,13 @@ func (b *VPodProvider) SyncAllBizStatusToKube(ctx context.Context, bizStatusData
 
 // SyncBizStatusToKube is a method of VPodProvider that synchronizes the information of a single container
 func (b *VPodProvider) SyncBizStatusToKube(ctx context.Context, bizStatusData model.BizStatusData) {
+	// Update the revision tracking if the bizStatusData has a revision
+	if bizStatusData.Revision > 0 {
+		b.vPodStore.UpdateBizRevision(bizStatusData.Key, bizStatusData.Revision)
+		log.G(ctx).Infof("Updated revision for module %s to %d from SyncBizStatusToKube",
+			bizStatusData.Key, bizStatusData.Revision)
+	}
+
 	namespace, name := utils.GetNameSpaceAndNameFromPodKey(bizStatusData.PodKey)
 	pod := &corev1.Pod{}
 	err := b.cache.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, pod)
@@ -187,7 +210,36 @@ func (b *VPodProvider) handleBizBatchStart(ctx context.Context, pod *corev1.Pod,
 		labelMap = make(map[string]string)
 	}
 
+	// Get the pod revision from annotations or generate a new one
+	podRevision := time.Now().UnixNano() // Default to current time in nanoseconds as revision
+	if pod.Annotations != nil {
+		if revStr, ok := pod.Annotations[model.AnnotationKeyOfPodRevision]; ok {
+			var err error
+			parsedRev, err := utils.ParseInt64(revStr)
+			if err != nil {
+				logger.WithError(err).Warnf("Failed to parse pod revision from annotation, using generated revision: %d", podRevision)
+			} else {
+				podRevision = parsedRev
+			}
+		}
+	}
+
 	for _, container := range containers {
+		bizKey := utils.GetBizUniqueKey(&container)
+
+		// Update the revision for this biz before starting
+		// This ensures any newer module instance will have a higher revision
+		currentRevision := b.vPodStore.GetBizRevision(bizKey)
+		if podRevision <= currentRevision {
+			// Make sure the new revision is higher than the current one
+			podRevision = currentRevision + 1
+		}
+
+		// Update the revision in the store before starting the container
+		b.vPodStore.UpdateBizRevision(bizKey, podRevision)
+
+		logger.Infof("Starting module %s with revision %d", bizKey, podRevision)
+
 		err := tracker.G().FuncTrack(labelMap[model.LabelKeyOfTraceID], model.TrackSceneVPodDeploy, model.TrackEventContainerStart, labelMap, func() (error, model.ErrorCode) {
 			err := utils.CallWithRetry(ctx, func(_ int) (bool, error) {
 				innerErr := b.tunnel.StartBiz(b.nodeName, podKey, &container)
@@ -195,9 +247,9 @@ func (b *VPodProvider) handleBizBatchStart(ctx context.Context, pod *corev1.Pod,
 				return innerErr != nil, innerErr
 			}, nil)
 			if err != nil {
-				return err, model.CodeContainerStartFailed
+				logger.WithError(err).WithField("containerKey", utils.GetContainerKey(podKey, container.Name)).Error("ContainerStartFailed")
 			}
-			return nil, model.CodeSuccess
+			return err, model.CodeSuccess
 		})
 		if err != nil {
 			logger.WithError(err).WithField("containerKey", utils.GetContainerKey(podKey, container.Name)).Error("ContainerStartFailed")
@@ -218,6 +270,27 @@ func (b *VPodProvider) handleBizBatchStop(ctx context.Context, pod *corev1.Pod, 
 	}
 
 	for _, container := range containers {
+		bizKey := utils.GetBizUniqueKey(&container)
+		podRevision := int64(0)
+
+		// Get the pod revision from annotations if available
+		if pod.Annotations != nil {
+			if revStr, ok := pod.Annotations[model.AnnotationKeyOfPodRevision]; ok {
+				var err error
+				podRevision, err = utils.ParseInt64(revStr)
+				if err != nil {
+					logger.WithError(err).Warnf("Failed to parse pod revision from annotation, defaulting to 0")
+				}
+			}
+		}
+
+		// Check if the biz should be deleted based on revision comparison
+		if !b.vPodStore.ShouldDeleteBiz(bizKey, podRevision) {
+			logger.Infof("Skipping deletion of module %s as its revision %d is less than current revision %d",
+				bizKey, podRevision, b.vPodStore.GetBizRevision(bizKey))
+			continue
+		}
+
 		err := tracker.G().FuncTrack(labelMap[model.LabelKeyOfTraceID], model.TrackSceneVPodDeploy, model.TrackEventContainerShutdown, labelMap, func() (error, model.ErrorCode) {
 			err := utils.CallWithRetry(ctx, func(_ int) (bool, error) {
 				innerErr := b.tunnel.StopBiz(b.nodeName, podKey, &container)
@@ -267,6 +340,18 @@ func (b *VPodProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 		return pkgerrors.Errorf("pod %s not found when updating", podKey)
 	}
 
+	// Get the new revision from annotations
+	newRevision := int64(0)
+	if newPod.Annotations != nil {
+		if revStr, ok := newPod.Annotations[model.AnnotationKeyOfPodRevision]; ok {
+			var err error
+			newRevision, err = utils.ParseInt64(revStr)
+			if err != nil {
+				logger.WithError(err).Warnf("Failed to parse pod revision from annotation, defaulting to 0")
+			}
+		}
+	}
+
 	newContainerMap := make(map[string]corev1.Container)
 	oldContainerMap := make(map[string]corev1.Container)
 	for _, container := range newPod.Spec.Containers {
@@ -291,8 +376,18 @@ func (b *VPodProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 			shouldStartContainers = append(shouldStartContainers, newContainer)
 		}
 	}
+
 	if len(shouldStopContainers) > 0 {
 		b.handleBizBatchStop(ctx, oldPod, shouldStopContainers)
+	}
+
+	// Update the revision for all containers in the new pod
+	for _, container := range newPod.Spec.Containers {
+		bizKey := utils.GetBizUniqueKey(&container)
+		if bizKey != "" {
+			b.vPodStore.UpdateBizRevision(bizKey, newRevision)
+			logger.Infof("Updated revision for module %s to %d", bizKey, newRevision)
+		}
 	}
 
 	b.vPodStore.PutPod(newPod.DeepCopy())
@@ -352,7 +447,7 @@ func (b *VPodProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 
 	// delete from curr provider
 	b.vPodStore.DeletePod(podKey)
-	// should not stop biz when delete pod, it should stopped when pod
+	// Handle stopping the module containers with revision check
 	b.handleBizBatchStop(ctx, pod, pod.Spec.Containers)
 	b.notify(pod)
 	return nil

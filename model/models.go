@@ -54,6 +54,7 @@ type BizStatusData struct {
 	ChangeTime time.Time // Time of state change
 	Reason     string    // Reason for state change
 	Message    string    // Message for state change
+	Revision   int64     // Revision number of the module instance, used for version control
 }
 
 type BuildVNodeConfig struct {
